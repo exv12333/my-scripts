@@ -12669,6 +12669,312 @@ return NeverLose;
 			v43 = v46:AddSection({ Name = "PROFILE", Position = "left" })
 			v44 = v46:AddSection({ Name = "CONTROLS", Position = "right" })
 			v45 = v46:AddSection({ Name = "STATISTICS", Position = "right" })
+
+-- ==========================================================
+-- // ИНТЕГРАЦИЯ HIMENO SCRIPTS (AUTO GRAB & PALLET) \\ --
+-- ==========================================================
+local himenoSection = v18:AddSection({
+    Name = "HIMENO SCRIPTS",
+    Position = "right"
+})
+
+local clock = os.clock
+local floor = math.floor
+local format = string.format
+local lower = string.lower
+local find = string.find
+local deg = math.deg
+local v3new = Vector3.new
+
+local Mouse = localPlayer:GetMouse()
+local VirtualInputMgr = game:GetService("VirtualInputManager")
+
+-- // Настройки (могут изменяться ползунками) \\ --
+local MAX_DISTANCE = 28
+local CLICK_COOLDOWN = 0.5
+local PALLET_DISTANCE = 4.5
+local PALLET_COOLDOWN = 0.2
+local THROW_IGNORE_TIME = 0.45
+
+local PALLET_OFFSET = v3new(0, -3.0, 0)
+
+-- Состояния
+local autoGrabActive = false
+local palletSpawnEnabled = true
+local isHoldingTarget = false
+local isSimulatingClick = false
+local activeGrabInstance = nil
+local lastGrabTime = 0
+local lastClickTime = 0
+local lastPalletTime = 0
+local lastReleaseTime = 0
+
+-- Кэш
+local myChar = localPlayer.Character
+local myRoot = nil
+local lastPart = nil
+local lastValid = false
+local lastTargetRoot = nil
+local lastHumanoid = nil
+local SpawnToyEvent = nil
+
+local connections = {}
+local scanConnection = nil
+local grabAncestryConn = nil
+local diedConnection = nil
+
+local grabToggleUI = nil
+local grabBindUI = nil
+
+local function getSpawnEvent()
+    if SpawnToyEvent then return SpawnToyEvent end
+    local menuToys = ReplicatedStorage_:FindFirstChild("MenuToys")
+    if menuToys then
+        SpawnToyEvent = menuToys:FindFirstChild("SpawnToyRemoteFunction")
+    end
+    return SpawnToyEvent
+end
+
+task.spawn(function()
+    local menuToys = ReplicatedStorage_:WaitForChild("MenuToys", 5)
+    if menuToys then
+        SpawnToyEvent = menuToys:WaitForChild("SpawnToyRemoteFunction", 5)
+    end
+end)
+
+local function clearHoldState()
+    if grabAncestryConn then grabAncestryConn:Disconnect(); grabAncestryConn = nil end
+    activeGrabInstance = nil
+    lastReleaseTime = clock()
+    isHoldingTarget = false
+end
+
+local function bindGrabInstance(instance)
+    if grabAncestryConn then grabAncestryConn:Disconnect() end
+    activeGrabInstance = instance
+    isHoldingTarget = true
+    grabAncestryConn = instance.AncestryChanged:Connect(function(_, parent)
+        if not parent then clearHoldState() end
+    end)
+end
+
+local function setupCharacter(char)
+    if diedConnection then diedConnection:Disconnect(); diedConnection = nil end
+    myChar = char
+    myRoot = nil
+    lastPart = nil
+    lastValid = false
+    lastTargetRoot = nil
+    lastHumanoid = nil
+    clearHoldState()
+    if not char then return end
+
+    Mouse.TargetFilter = char
+    myRoot = char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart", 5)
+    local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
+    if hum then diedConnection = hum.Died:Connect(clearHoldState) end
+end
+
+if myChar then task.spawn(setupCharacter, myChar) end
+table.insert(connections, localPlayer.CharacterAdded:Connect(setupCharacter))
+
+local hasNativeClick = (type(mouse1press) == "function" and type(mouse1release) == "function")
+
+local function simulateSingleClick()
+    if isSimulatingClick then return end
+    isSimulatingClick = true
+    lastClickTime = clock()
+    local x, y = Mouse.X, Mouse.Y
+    
+    if hasNativeClick then
+        mouse1press()
+    else
+        VirtualInputMgr:SendMouseButtonEvent(x, y, 0, true, game, 0)
+    end
+    
+    task.delay(0.04, function()
+        if hasNativeClick then
+            mouse1release()
+        else
+            VirtualInputMgr:SendMouseButtonEvent(x, y, 0, false, game, 0)
+        end
+        isSimulatingClick = false
+    end)
+end
+
+local function spawnPalletOnly()
+    if not palletSpawnEnabled then return end
+    local now = clock()
+    if now - lastPalletTime < PALLET_COOLDOWN then return end
+    local event = getSpawnEvent()
+    local cam = Workspace.CurrentCamera
+    if not event or not cam then return end
+
+    lastPalletTime = now
+    local camCFrame = cam.CFrame
+    local spawnPosition = camCFrame.Position + (camCFrame.LookVector * PALLET_DISTANCE) + PALLET_OFFSET
+    local _, yaw, _ = camCFrame:ToOrientation()
+    local newCFrame = camCFrame.Rotation + spawnPosition
+    local rotationVector = v3new(0, deg(yaw), 0)
+
+    task.spawn(function()
+        pcall(event.InvokeServer, event, "PalletLightBrown", newCFrame, rotationVector)
+    end)
+end
+
+local function isSpecialKeyword(str)
+    return find(str, "blobman", 1, true) or find(str, "little", 1, true) or find(str, "decoy", 1, true) or find(str, "mascot", 1, true)
+end
+
+local function checkIsTarget(targetInstance)
+    if not targetInstance or not myRoot or not myChar then return false end
+    if targetInstance == lastPart then
+        if not lastValid then return false end
+        if lastHumanoid and lastHumanoid.Health <= 0 then lastValid = false; return false end
+        local checkPos = (lastTargetRoot and lastTargetRoot.Parent) and lastTargetRoot.Position or targetInstance.Position
+        return (myRoot.Position - checkPos).Magnitude <= MAX_DISTANCE
+    end
+
+    lastPart = targetInstance
+    lastValid = false
+    lastTargetRoot = nil
+    lastHumanoid = nil
+
+    if (myRoot.Position - targetInstance.Position).Magnitude > (MAX_DISTANCE + 12) then return false end
+    if targetInstance:IsDescendantOf(myChar) then return false end
+
+    local instanceName = lower(targetInstance.Name)
+    if find(instanceName, "pallet", 1, true) or find(instanceName, "baseplate", 1, true) or find(instanceName, "floor", 1, true) then return false end
+    if isSpecialKeyword(instanceName) then
+        lastValid = true; lastTargetRoot = targetInstance
+        return (myRoot.Position - targetInstance.Position).Magnitude <= MAX_DISTANCE
+    end
+
+    local model = targetInstance:FindFirstAncestorOfClass("Model")
+    if model and model ~= myChar then
+        local modelName = lower(model.Name)
+        if find(modelName, "pallet", 1, true) then return false end
+        local humanoid = model:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            if humanoid.Health <= 0 then return false end
+            local tRoot = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or targetInstance
+            lastValid = true; lastHumanoid = humanoid; lastTargetRoot = tRoot
+            return (myRoot.Position - tRoot.Position).Magnitude <= MAX_DISTANCE
+        end
+        if isSpecialKeyword(modelName) then
+            local tRoot = model.PrimaryPart or targetInstance
+            lastValid = true; lastTargetRoot = tRoot
+            return (myRoot.Position - tRoot.Position).Magnitude <= MAX_DISTANCE
+        end
+        local parent = model.Parent
+        if parent and parent ~= Workspace then
+            local parentName = lower(parent.Name)
+            if not find(parentName, "pallet", 1, true) and isSpecialKeyword(parentName) then
+                lastValid = true; lastTargetRoot = targetInstance
+                return (myRoot.Position - targetInstance.Position).Magnitude <= MAX_DISTANCE
+            end
+        end
+    end
+    return false
+end
+
+local function scanAndGrab()
+    if isHoldingTarget then
+        if not activeGrabInstance or not activeGrabInstance.Parent then clearHoldState() else return end
+    end
+    if (clock() - lastReleaseTime) < THROW_IGNORE_TIME then return end
+    if isSimulatingClick then return end
+    local now = clock()
+    if now - lastGrabTime < CLICK_COOLDOWN then return end
+
+    if checkIsTarget(Mouse.Target) then
+        lastGrabTime = now
+        simulateSingleClick()
+    end
+end
+
+local function toggleScanLoop(enable)
+    if enable and not scanConnection then
+        scanConnection = RunService.RenderStepped:Connect(scanAndGrab)
+    elseif not enable and scanConnection then
+        scanConnection:Disconnect()
+        scanConnection = nil
+    end
+end
+
+table.insert(connections, Workspace.ChildAdded:Connect(function(child)
+    if child.Name == "GrabParts" and (clock() - lastClickTime) <= 0.35 then
+        bindGrabInstance(child)
+    end
+end))
+
+table.insert(connections, UserInputService_.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 and not isSimulatingClick then
+        lastClickTime = clock()
+        if isHoldingTarget then
+            task.delay(0.1, function()
+                if not activeGrabInstance or not activeGrabInstance.Parent then clearHoldState() end
+            end)
+        end
+    end
+end))
+
+-- // UI ЭЛЕМЕНТЫ \\ --
+local grabLabel = himenoSection:AddLabel("Auto Grab (Triggerbot)")
+local grabToggleUI = grabLabel:AddToggle({
+    Default = false,
+    Flag = "HimenoAutoGrabToggle",
+    Callback = function(val)
+        autoGrabActive = val
+        lastPart = nil
+        clearHoldState()
+        toggleScanLoop(autoGrabActive)
+    end
+})
+grabLabel:AddKeybind({
+    Default = "Q",
+    Flag = "HimenoAutoGrabKey",
+    Callback = function(isPressed)
+        if not isPressed then return end
+        if grabToggleUI then grabToggleUI:SetValue(not grabToggleUI:GetValue()) end
+    end
+})
+
+local palletLabel = himenoSection:AddLabel("Spawn Pallet (Front)")
+palletLabel:AddToggle({
+    Default = true,
+    Flag = "HimenoPalletToggle",
+    Callback = function(val) palletSpawnEnabled = val end
+})
+palletLabel:AddKeybind({
+    Default = "Tab",
+    Flag = "HimenoPalletKey",
+    Callback = function(isPressed)
+        if not isPressed then return end
+        spawnPalletOnly()
+    end
+})
+
+himenoSection:AddLabel("Grab Max Distance"):AddSlider({
+    Default = 28, Min = 10, Max = 50, Rounding = 1, Flag = "HimenoGrabDist",
+    Callback = function(val) MAX_DISTANCE = val end
+})
+himenoSection:AddLabel("Grab Click Cooldown"):AddSlider({
+    Default = 0.5, Min = 0.05, Max = 1.5, Rounding = 2, Flag = "HimenoGrabCooldown",
+    Callback = function(val) CLICK_COOLDOWN = val end
+})
+himenoSection:AddLabel("Pallet Spawn Distance"):AddSlider({
+    Default = 4.5, Min = 2, Max = 20, Rounding = 1, Flag = "HimenoPalletDist",
+    Callback = function(val) PALLET_DISTANCE = val end
+})
+himenoSection:AddLabel("Pallet Spawn Cooldown"):AddSlider({
+    Default = 0.2, Min = 0.05, Max = 1, Rounding = 2, Flag = "HimenoPalletCD",
+    Callback = function(val) PALLET_COOLDOWN = val end
+})
+-- ==========================================================
+-- // КОНЕЦ ИНТЕГРАЦИИ HIMENO SCRIPTS \\ --
+-- ==========================================================
 		end
 
 		statsKicked = 0
